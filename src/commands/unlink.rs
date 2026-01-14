@@ -3,6 +3,7 @@ use colored::Colorize;
 
 use crate::config::GlobalConfig;
 use crate::linker::{LinkOptions, LinkResult, Linker};
+use crate::manifest::Manifest;
 use crate::repo::{discover_repos, find_repo, Repo};
 
 pub fn run(
@@ -29,36 +30,28 @@ pub fn run(
     for repo in &repos {
         println!("{}:", repo.name.bold());
 
-        let items = repo.items()?;
+        let manifest = Manifest::load(&repo.path).unwrap_or_default();
 
-        if items.is_empty() {
-            println!("  (no items)");
-            continue;
-        }
+        if manifest.is_empty() {
+            let items = repo.items()?;
+            if items.is_empty() {
+                println!("  (no items)");
+                continue;
+            }
 
-        for item in &items {
-            match linker.unlink_item(item, options) {
-                Ok(result) => {
-                    match result {
-                        LinkResult::Created => {
-                            println!("  {} {}", "✓".green(), item.relative_path);
-                        }
-                        LinkResult::Skipped { reason } => {
-                            if options.verbose {
-                                println!(
-                                    "  {} {} ({})",
-                                    "⊘".yellow(),
-                                    item.relative_path,
-                                    reason.dimmed()
-                                );
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Err(e) => {
-                    println!("  {} {} ({})", "✗".red(), item.relative_path, e);
-                }
+            for item in &items {
+                let result = linker.unlink_item(item, options);
+                print_unlink_result(&item.relative_path, result, options.verbose);
+            }
+        } else {
+            for (path, entry) in manifest.iter() {
+                let target = repo.target.join(path);
+                let result = linker.unlink_from_manifest(&target, *entry, options);
+                print_unlink_result(path, result, options.verbose);
+            }
+
+            if !options.dry_run {
+                Manifest::default().save(&repo.path)?;
             }
         }
 
@@ -70,4 +63,23 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn print_unlink_result(path: &str, result: Result<LinkResult>, verbose: bool) {
+    match result {
+        Ok(LinkResult::Unlinked) => {
+            println!("  {} {}", "✓".green(), path);
+        }
+        Ok(LinkResult::Skipped { reason }) => {
+            if verbose {
+                println!("  {} {} ({})", "⊘".yellow(), path, reason.dimmed());
+            }
+        }
+        Ok(LinkResult::Created { .. })
+        | Ok(LinkResult::AlreadyCorrect { .. })
+        | Ok(LinkResult::BackedUp { .. }) => {}
+        Err(e) => {
+            println!("  {} {} ({})", "✗".red(), path, e);
+        }
+    }
 }

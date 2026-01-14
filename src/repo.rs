@@ -23,6 +23,7 @@ pub struct RepoItem {
     pub target: PathBuf,
     pub relative_path: String,
     pub is_template: bool,
+    pub strategy: Strategy,
 }
 
 /// Discover all repos in ~/.homie/repos/
@@ -154,6 +155,7 @@ impl Repo {
                 }
 
                 item.target = compute_target(&self.target, &remapped, item.is_template);
+                item.strategy = self.config.strategy_for_path(&remapped_str);
                 item.relative_path = remapped_str.clone();
                 seen_paths.insert(remapped_str);
                 items.push(item);
@@ -193,17 +195,18 @@ impl Repo {
             }
 
             let is_template = source.extension().is_some_and(|e| e == "tmpl");
-
+            let strategy = self.config.strategy_for_path(&relative_str);
             let target = compute_target(&self.target, relative, is_template);
 
             if entry.file_type().is_dir() {
-                if self.config.strategy_for_path(&relative_str) == Strategy::Directory {
+                if strategy.is_directory_unit() {
                     processed_dirs.insert(relative.to_path_buf());
                     items.push(RepoItem {
                         source,
                         target,
                         relative_path: relative_str,
                         is_template,
+                        strategy,
                     });
                 }
                 continue;
@@ -214,6 +217,7 @@ impl Repo {
                 target,
                 relative_path: relative_str,
                 is_template,
+                strategy,
             });
         }
 

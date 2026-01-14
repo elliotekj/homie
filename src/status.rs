@@ -6,6 +6,7 @@ use crate::repo::RepoItem;
 #[derive(Debug, Default)]
 pub struct RepoStatus {
     pub linked: usize,
+    pub copied: usize,
     pub external: usize,
     pub missing: usize,
     pub conflict: usize,
@@ -15,6 +16,7 @@ pub struct RepoStatus {
 #[derive(Debug)]
 pub enum ItemStatus {
     Linked,
+    Copied,
     External(String),
     Missing,
     Conflict,
@@ -23,12 +25,11 @@ pub enum ItemStatus {
 
 impl RepoStatus {
     pub fn total(&self) -> usize {
-        self.linked + self.external + self.missing + self.conflict + self.rendered
+        self.linked + self.copied + self.external + self.missing + self.conflict + self.rendered
     }
 }
 
 pub fn check_item_status(item: &RepoItem, repo_path: &Path) -> ItemStatus {
-    // Templates are rendered files, not symlinks
     if item.is_template {
         return if item.target.exists() {
             ItemStatus::Rendered
@@ -37,8 +38,17 @@ pub fn check_item_status(item: &RepoItem, repo_path: &Path) -> ItemStatus {
         };
     }
 
+    let is_copy = item.strategy.is_copy();
+
     if !item.target.exists() && !item.target.is_symlink() {
         return ItemStatus::Missing;
+    }
+
+    if is_copy {
+        if item.target.exists() && !item.target.is_symlink() {
+            return ItemStatus::Copied;
+        }
+        return ItemStatus::Conflict;
     }
 
     if !item.target.is_symlink() {

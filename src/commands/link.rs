@@ -2,7 +2,8 @@ use anyhow::{bail, Result};
 use colored::Colorize;
 
 use crate::config::GlobalConfig;
-use crate::linker::{print_result, LinkOptions, Linker};
+use crate::linker::{print_result, LinkOptions, LinkResult, Linker};
+use crate::manifest::Manifest;
 use crate::repo::{discover_repos, find_repo, Repo};
 use crate::vars::VarResolver;
 
@@ -31,7 +32,6 @@ pub fn run(
     for repo in &repos {
         println!("{}:", repo.name.bold());
 
-        // Fetch git imports if needed
         if !options.no_fetch && !repo.imports.is_empty() {
             repo.fetch_imports(options.dry_run)?;
         }
@@ -44,15 +44,32 @@ pub fn run(
             continue;
         }
 
+        let mut manifest = Manifest::default();
+
         for item in &items {
             match linker.link_item(item, &var_resolver, &repo.path, options) {
                 Ok(result) => {
                     print_result(&item.relative_path, &result, options.verbose);
+
+                    let entry = match &result {
+                        LinkResult::Created { entry } => Some(*entry),
+                        LinkResult::AlreadyCorrect { entry } => Some(*entry),
+                        LinkResult::BackedUp { entry, .. } => Some(*entry),
+                        LinkResult::Skipped { .. } => None,
+                        LinkResult::Unlinked => None,
+                    };
+                    if let Some(entry) = entry {
+                        manifest.insert(item.relative_path.clone(), entry);
+                    }
                 }
                 Err(e) => {
                     println!("  {} {} ({})", "✗".red(), item.relative_path, e);
                 }
             }
+        }
+
+        if !options.dry_run && !manifest.is_empty() {
+            manifest.save(&repo.path)?;
         }
 
         println!();

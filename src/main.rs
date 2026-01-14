@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod import;
 mod linker;
+mod manifest;
 mod repo;
 mod status;
 mod strategy;

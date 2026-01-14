@@ -8,7 +8,7 @@ Dotfiles symlink orchestrator with templates and multiple repo support.
 ## Features
 
 - **Multi-repo management** - Organize dotfiles across multiple repositories
-- **Three linking strategies** - Link files, directories, or directory contents
+- **Four linking strategies** - Link files, directories, directory contents, or copy
 - **Template support** - Render `.tmpl` files with variable substitution
 - **Git/local imports** - Pull files from external git repos or local paths
 - **Smart conflict resolution** - Preserve external symlinks, backup on force
@@ -83,13 +83,15 @@ target = "~"
 git_user = "work-account"
 
 [defaults]
-# Default linking strategy: "file", "directory", or "contents"
+# Default linking strategy: "file", "directory", "contents", or "copy"
 strategy = "file"
 
 [strategies]
-# Override strategy for specific paths
+# Override strategy for specific paths (supports glob patterns)
 ".config/nvim" = "directory"    # link entire directory
 ".local/bin" = "contents"       # link parent, contents individually
+".config/app" = "copy"          # copy instead of symlink
+"*.plist" = "copy"              # glob: matches at any depth
 
 [ignore]
 # Additional paths to ignore (glob patterns)
@@ -160,6 +162,29 @@ Repo:                        Target:
   ├── script1               ~/.local/bin/script1 (symlink)
   └── script2               ~/.local/bin/script2 (symlink)
 ```
+
+### Copy
+
+Files are copied instead of symlinked. Use for applications that don't follow symlinks or resolve them incorrectly.
+
+```toml
+[strategies]
+".config/app" = "copy"       # copy entire directory
+"settings.json" = "copy"     # copy single file
+"*.plist" = "copy"           # glob pattern (matches at any depth)
+```
+
+```
+Repo:                        Target:
+.config/app/        →       ~/.config/app/ (copied dir)
+  └── config.toml           ~/.config/app/config.toml (copied file)
+```
+
+Copy behavior:
+- Always overwrites target (no `--force` needed)
+- Preserves source file permissions
+- Works with templates (rendered then copied)
+- Explicit paths take precedence over glob patterns
 
 </details>
 
@@ -306,7 +331,7 @@ homie link -n           # dry run
 
 #### `homie unlink [REPO]`
 
-Remove symlinks managed by homie.
+Remove files managed by homie (symlinks and copies).
 
 ```bash
 homie unlink            # unlink all repos
@@ -315,7 +340,7 @@ homie unlink dotfiles   # unlink specific repo
 
 #### `homie status [REPO]`
 
-Show the state of each symlink.
+Show the state of managed files.
 
 ```bash
 homie status
@@ -324,6 +349,7 @@ homie status -v         # verbose (show all files)
 
 Status indicators:
 - `✓` linked correctly
+- `⬆` copied file
 - `~` rendered template
 - `→` external symlink (not managed)
 - `✗` missing or conflict

@@ -6,6 +6,7 @@ use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::GlobalConfig;
+use crate::manifest::ManifestEntry;
 use crate::repo::RepoItem;
 use crate::template::TemplateEngine;
 use crate::vars::VarResolver;
@@ -20,11 +21,11 @@ pub struct LinkOptions {
 
 #[derive(Debug)]
 pub enum LinkResult {
-    Created,
-    AlreadyCorrect,
+    Created { entry: ManifestEntry },
+    AlreadyCorrect { entry: ManifestEntry },
     Skipped { reason: String },
-    BackedUp { backup_path: PathBuf },
-    Rendered,
+    BackedUp { backup_path: PathBuf, entry: ManifestEntry },
+    Unlinked,
 }
 
 pub struct Linker {
@@ -50,19 +51,29 @@ impl Linker {
         repo_path: &Path,
         options: LinkOptions,
     ) -> Result<LinkResult> {
-        // Handle templates differently - they render to files, not symlinks
         if item.is_template {
             return self.render_template(item, var_resolver, options);
         }
 
-        // Check if source is a broken symlink
         if item.source.is_symlink() && !item.source.exists() {
             return Ok(LinkResult::Skipped {
                 reason: "source is broken symlink".to_string(),
             });
         }
 
-        // Check target state
+        if item.strategy.is_copy() {
+            self.copy_item(item, options)
+        } else {
+            self.symlink_item(item, repo_path, options)
+        }
+    }
+
+    fn symlink_item(
+        &self,
+        item: &RepoItem,
+        repo_path: &Path,
+        options: LinkOptions,
+    ) -> Result<LinkResult> {
         let target_state = classify_target(&item.target, repo_path, &self.replaceable_paths)?;
 
         match target_state {
@@ -70,7 +81,6 @@ impl Linker {
                 self.create_symlink(&item.source, &item.target, options)
             }
             TargetState::SymlinkToRepo | TargetState::SymlinkToReplaceable => {
-                // Replace with our symlink
                 if !options.dry_run {
                     fs::remove_file(&item.target)
                         .with_context(|| format!("Failed to remove: {}", item.target.display()))?;
@@ -97,7 +107,7 @@ impl Linker {
                             .with_context(|| format!("Failed to backup: {}", item.target.display()))?;
                     }
                     self.create_symlink(&item.source, &item.target, options)?;
-                    Ok(LinkResult::BackedUp { backup_path })
+                    Ok(LinkResult::BackedUp { backup_path, entry: ManifestEntry::Symlink })
                 } else {
                     Ok(LinkResult::Skipped {
                         reason: "file exists (use --force to backup)".to_string(),
@@ -107,9 +117,46 @@ impl Linker {
         }
     }
 
+    fn copy_item(&self, item: &RepoItem, options: LinkOptions) -> Result<LinkResult> {
+        if !options.dry_run {
+            if let Some(parent) = item.target.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+            }
+        }
+
+        if item.target.is_symlink() {
+            if !options.dry_run {
+                fs::remove_file(&item.target)
+                    .with_context(|| format!("Failed to remove existing symlink: {}", item.target.display()))?;
+            }
+        } else if item.target.exists() {
+            if item.source.is_dir() {
+                if !options.dry_run {
+                    fs::remove_dir_all(&item.target)
+                        .with_context(|| format!("Failed to remove existing dir: {}", item.target.display()))?;
+                }
+            } else if files_are_identical(&item.source, &item.target)? {
+                return Ok(LinkResult::AlreadyCorrect { entry: ManifestEntry::Copy });
+            }
+        }
+
+        if options.dry_run {
+            return Ok(LinkResult::Created { entry: ManifestEntry::Copy });
+        }
+
+        if item.source.is_dir() {
+            copy_dir_recursive(&item.source, &item.target)?;
+        } else {
+            copy_file_with_perms(&item.source, &item.target)?;
+        }
+
+        Ok(LinkResult::Created { entry: ManifestEntry::Copy })
+    }
+
     fn create_symlink(&self, source: &Path, target: &Path, options: LinkOptions) -> Result<LinkResult> {
         if options.dry_run {
-            return Ok(LinkResult::Created);
+            return Ok(LinkResult::Created { entry: ManifestEntry::Symlink });
         }
 
         // Ensure parent directory exists
@@ -129,7 +176,7 @@ impl Linker {
         unix_fs::symlink(&resolved_source, target)
             .with_context(|| format!("Failed to create symlink: {} -> {}", target.display(), resolved_source.display()))?;
 
-        Ok(LinkResult::Created)
+        Ok(LinkResult::Created { entry: ManifestEntry::Symlink })
     }
 
     fn render_template(
@@ -141,28 +188,32 @@ impl Linker {
         let vars = var_resolver.to_template_data();
         let rendered = self.template_engine.render_file(&item.source, &vars)?;
 
+        let entry = if item.strategy.is_copy() {
+            ManifestEntry::Copy
+        } else {
+            ManifestEntry::Rendered
+        };
+
         if options.dry_run {
-            return Ok(LinkResult::Rendered);
+            return Ok(LinkResult::Created { entry });
         }
 
-        // Ensure parent directory exists
         if let Some(parent) = item.target.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
         }
 
-        // Check if target already exists and has same content
         if item.target.exists() {
             let existing = fs::read_to_string(&item.target).unwrap_or_default();
             if existing == rendered {
-                return Ok(LinkResult::AlreadyCorrect);
+                return Ok(LinkResult::AlreadyCorrect { entry });
             }
         }
 
         fs::write(&item.target, &rendered)
             .with_context(|| format!("Failed to write: {}", item.target.display()))?;
 
-        Ok(LinkResult::Rendered)
+        Ok(LinkResult::Created { entry })
     }
 
     fn backup_path(&self, path: &Path) -> Result<PathBuf> {
@@ -188,7 +239,6 @@ impl Linker {
             });
         }
 
-        // Only remove if it's a symlink pointing to our source (or a rendered template)
         if item.target.is_symlink() {
             let link_target = fs::read_link(&item.target)?;
             let resolved = if link_target.is_absolute() {
@@ -202,7 +252,7 @@ impl Linker {
                     reason: "symlink points elsewhere".to_string(),
                 });
             }
-        } else if !item.is_template {
+        } else if !item.is_template && !item.strategy.is_copy() {
             return Ok(LinkResult::Skipped {
                 reason: "not a symlink".to_string(),
             });
@@ -216,7 +266,52 @@ impl Linker {
             }
         }
 
-        Ok(LinkResult::Created) // Using Created to mean "action taken"
+        Ok(LinkResult::Unlinked)
+    }
+
+    pub fn unlink_from_manifest(
+        &self,
+        target: &Path,
+        entry: ManifestEntry,
+        options: LinkOptions,
+    ) -> Result<LinkResult> {
+        if !target.exists() && !target.is_symlink() {
+            return Ok(LinkResult::Skipped {
+                reason: "does not exist".to_string(),
+            });
+        }
+
+        if !options.dry_run {
+            match entry {
+                ManifestEntry::Symlink => {
+                    if target.is_symlink() {
+                        fs::remove_file(target)?;
+                    } else {
+                        return Ok(LinkResult::Skipped {
+                            reason: "expected symlink, found regular file".to_string(),
+                        });
+                    }
+                }
+                ManifestEntry::Copy => {
+                    if target.is_dir() && !target.is_symlink() {
+                        fs::remove_dir_all(target)?;
+                    } else {
+                        fs::remove_file(target)?;
+                    }
+                }
+                ManifestEntry::Rendered => {
+                    if target.is_file() {
+                        fs::remove_file(target)?;
+                    } else {
+                        return Ok(LinkResult::Skipped {
+                            reason: "expected file, found directory".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(LinkResult::Unlinked)
     }
 }
 
@@ -270,12 +365,65 @@ fn classify_target(target: &Path, repo_path: &Path, replaceable_paths: &[PathBuf
     }
 }
 
+fn files_are_identical(source: &Path, target: &Path) -> Result<bool> {
+    let source_content = fs::read(source)
+        .with_context(|| format!("Failed to read source: {}", source.display()))?;
+    let target_content = fs::read(target)
+        .with_context(|| format!("Failed to read target: {}", target.display()))?;
+    Ok(source_content == target_content)
+}
+
+fn copy_file_with_perms(source: &Path, target: &Path) -> Result<()> {
+    fs::copy(source, target)
+        .with_context(|| format!("Failed to copy {} to {}", source.display(), target.display()))?;
+
+    let source_metadata = fs::metadata(source)
+        .with_context(|| format!("Failed to get metadata: {}", source.display()))?;
+    let perms = source_metadata.permissions();
+    fs::set_permissions(target, perms)
+        .with_context(|| format!("Failed to set permissions: {}", target.display()))?;
+
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)
+        .with_context(|| format!("Failed to create directory: {}", target.display()))?;
+
+    let source_metadata = fs::metadata(source)
+        .with_context(|| format!("Failed to get metadata: {}", source.display()))?;
+    fs::set_permissions(target, source_metadata.permissions())
+        .with_context(|| format!("Failed to set permissions: {}", target.display()))?;
+
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("Failed to read directory: {}", source.display()))?
+    {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let entry_name = entry.file_name();
+        let target_path = target.join(&entry_name);
+
+        if entry_path.is_dir() {
+            copy_dir_recursive(&entry_path, &target_path)?;
+        } else {
+            copy_file_with_perms(&entry_path, &target_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 pub fn print_result(relative_path: &str, result: &LinkResult, verbose: bool) {
     match result {
-        LinkResult::Created => {
-            println!("  {} {}", "✓".green(), relative_path);
+        LinkResult::Created { entry } => {
+            let suffix = match entry {
+                ManifestEntry::Symlink => "",
+                ManifestEntry::Copy => " (copied)",
+                ManifestEntry::Rendered => " (rendered)",
+            };
+            println!("  {} {}{}", "✓".green(), relative_path, suffix);
         }
-        LinkResult::AlreadyCorrect => {
+        LinkResult::AlreadyCorrect { entry: _ } => {
             if verbose {
                 println!("  {} {} (unchanged)", "✓".green(), relative_path.dimmed());
             }
@@ -283,7 +431,7 @@ pub fn print_result(relative_path: &str, result: &LinkResult, verbose: bool) {
         LinkResult::Skipped { reason } => {
             println!("  {} {} ({})", "⊘".yellow(), relative_path, reason.dimmed());
         }
-        LinkResult::BackedUp { backup_path } => {
+        LinkResult::BackedUp { backup_path, entry: _ } => {
             println!(
                 "  {} {} (backup: {})",
                 "⚠".yellow(),
@@ -291,8 +439,8 @@ pub fn print_result(relative_path: &str, result: &LinkResult, verbose: bool) {
                 backup_path.file_name().unwrap_or_default().to_string_lossy()
             );
         }
-        LinkResult::Rendered => {
-            println!("  {} {} (rendered)", "✓".green(), relative_path);
+        LinkResult::Unlinked => {
+            println!("  {} {}", "✓".green(), relative_path);
         }
     }
 }
@@ -300,6 +448,7 @@ pub fn print_result(relative_path: &str, result: &LinkResult, verbose: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strategy::Strategy;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
@@ -415,7 +564,7 @@ mod tests {
         let linker = create_test_linker();
         let result = linker.create_symlink(&source, &target, default_options()).unwrap();
 
-        assert!(matches!(result, LinkResult::Created));
+        assert!(matches!(result, LinkResult::Created { .. }));
         assert!(target.is_symlink());
         assert_eq!(fs::read_to_string(&target).unwrap(), "content");
     }
@@ -430,7 +579,7 @@ mod tests {
         let linker = create_test_linker();
         let result = linker.create_symlink(&source, &target, default_options()).unwrap();
 
-        assert!(matches!(result, LinkResult::Created));
+        assert!(matches!(result, LinkResult::Created { .. }));
         assert!(target.is_symlink());
     }
 
@@ -445,7 +594,7 @@ mod tests {
         let options = LinkOptions { dry_run: true, ..default_options() };
         let result = linker.create_symlink(&source, &target, options).unwrap();
 
-        assert!(matches!(result, LinkResult::Created));
+        assert!(matches!(result, LinkResult::Created { .. }));
         assert!(!target.exists()); // Should not actually create
     }
 
@@ -465,13 +614,14 @@ mod tests {
             target: target.clone(),
             relative_path: "file.txt".to_string(),
             is_template: false,
+            strategy: Strategy::File,
         };
 
         let linker = create_test_linker();
         let var_resolver = VarResolver::new(&GlobalConfig::default(), None);
         let result = linker.link_item(&item, &var_resolver, &repo_path, default_options()).unwrap();
 
-        assert!(matches!(result, LinkResult::Created));
+        assert!(matches!(result, LinkResult::Created { .. }));
         assert!(target.is_symlink());
     }
 
@@ -491,6 +641,7 @@ mod tests {
             target: target.clone(),
             relative_path: "file.txt".to_string(),
             is_template: false,
+            strategy: Strategy::File,
         };
 
         let linker = create_test_linker();
@@ -517,6 +668,7 @@ mod tests {
             target: target.clone(),
             relative_path: "file.txt".to_string(),
             is_template: false,
+            strategy: Strategy::File,
         };
 
         let linker = create_test_linker();
@@ -544,13 +696,14 @@ mod tests {
             target: target.clone(),
             relative_path: "file.txt".to_string(),
             is_template: false,
+            strategy: Strategy::File,
         };
 
         let linker = create_test_linker();
         let var_resolver = VarResolver::new(&GlobalConfig::default(), None);
         let result = linker.link_item(&item, &var_resolver, &repo_path, default_options()).unwrap();
 
-        assert!(matches!(result, LinkResult::Created));
+        assert!(matches!(result, LinkResult::Created { .. }));
         assert_eq!(fs::read_to_string(&target).unwrap(), "content");
     }
 
@@ -575,6 +728,7 @@ mod tests {
             target: target.clone(),
             relative_path: "link.txt".to_string(),
             is_template: false,
+            strategy: Strategy::File,
         };
 
         let linker = create_test_linker();
@@ -601,12 +755,13 @@ mod tests {
             target: target.clone(),
             relative_path: "target.txt".to_string(),
             is_template: false,
+            strategy: Strategy::File,
         };
 
         let linker = create_test_linker();
         let result = linker.unlink_item(&item, default_options()).unwrap();
 
-        assert!(matches!(result, LinkResult::Created)); // Created means action taken
+        assert!(matches!(result, LinkResult::Unlinked));
         assert!(!target.exists());
     }
 
@@ -621,6 +776,7 @@ mod tests {
             target,
             relative_path: "nonexistent.txt".to_string(),
             is_template: false,
+            strategy: Strategy::File,
         };
 
         let linker = create_test_linker();
@@ -643,6 +799,7 @@ mod tests {
             target: target.clone(),
             relative_path: "target.txt".to_string(),
             is_template: false,
+            strategy: Strategy::File,
         };
 
         let linker = create_test_linker();

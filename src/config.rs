@@ -184,11 +184,22 @@ impl RepoConfig {
     }
 
     pub fn strategy_for_path(&self, path: &str) -> Strategy {
+        let mut glob_match_result: Option<Strategy> = None;
+
         for (pattern, strategy) in &self.strategies {
-            if path.starts_with(pattern) || glob_match(pattern, path) {
+            if path == pattern || path.starts_with(&format!("{}/", pattern)) {
                 return *strategy;
             }
+
+            if glob_match_result.is_none() && is_glob_pattern(pattern) && glob_matches(pattern, path) {
+                glob_match_result = Some(*strategy);
+            }
         }
+
+        if let Some(strategy) = glob_match_result {
+            return strategy;
+        }
+
         self.defaults.strategy
     }
 
@@ -217,6 +228,27 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     } else {
         pattern == path
     }
+}
+
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
+}
+
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    let Ok(glob_pattern) = glob::Pattern::new(pattern) else {
+        return false;
+    };
+
+    if glob_pattern.matches(path) {
+        return true;
+    }
+
+    let Some(file_name) = Path::new(path).file_name() else {
+        return false;
+    };
+    let file_name = file_name.to_string_lossy();
+
+    glob_pattern.matches(&file_name)
 }
 
 #[cfg(test)]
@@ -333,5 +365,66 @@ remap = [{ from = "commands", to = ".claude/commands" }]
         assert_eq!(config.imports[0].remap.len(), 1);
         assert_eq!(config.imports[0].remap[0].from, "commands");
         assert_eq!(config.imports[0].remap[0].to, ".claude/commands");
+    }
+
+    #[test]
+    fn test_strategy_for_path_explicit() {
+        let toml = r#"
+target = "~"
+
+[strategies]
+".config/app" = "copy"
+".config/nvim" = "directory"
+"#;
+
+        let config: RepoConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.strategy_for_path(".config/app"), Strategy::Copy);
+        assert_eq!(config.strategy_for_path(".config/app/settings.json"), Strategy::Copy);
+        assert_eq!(config.strategy_for_path(".config/nvim"), Strategy::Directory);
+        assert_eq!(config.strategy_for_path(".config/other"), Strategy::File);
+    }
+
+    #[test]
+    fn test_strategy_for_path_glob() {
+        let toml = r#"
+target = "~"
+
+[strategies]
+"*.plist" = "copy"
+"*.json" = "copy"
+"#;
+
+        let config: RepoConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.strategy_for_path("Library/Preferences/com.app.plist"), Strategy::Copy);
+        assert_eq!(config.strategy_for_path(".config/app/settings.json"), Strategy::Copy);
+        assert_eq!(config.strategy_for_path(".zshrc"), Strategy::File);
+    }
+
+    #[test]
+    fn test_strategy_for_path_explicit_precedence() {
+        let toml = r#"
+target = "~"
+
+[strategies]
+"*.json" = "copy"
+".config/app/settings.json" = "file"
+"#;
+
+        let config: RepoConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.strategy_for_path(".config/app/settings.json"), Strategy::File);
+        assert_eq!(config.strategy_for_path(".config/other/data.json"), Strategy::Copy);
+    }
+
+    #[test]
+    fn test_parse_copy_strategy() {
+        let toml = r#"
+target = "~"
+
+[strategies]
+".config/app" = "copy"
+"#;
+
+        let config: RepoConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.strategies.get(".config/app"), Some(&Strategy::Copy));
     }
 }
